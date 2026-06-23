@@ -7,16 +7,18 @@ From The Devil's Dictionary (1881-1906) [devil]:
   not particularly care to trace his own.
 
 
-
+```
 start gui:
-python genealogy.py -e sqlite3 -g 
 python genealogy.py -e sqlite3 -g -d family_new.db
 
 report generation from command line:
 python genealogy.py -c --report --group "All Families" -r -d family_new.db
 
+Generate PDF and html reports:
 Creates report.html and related files in Fami* directory
-to generate pdf: ( run pdflatex twice )
+to generate pdf from tex file generated: 
+Run pdflatex twice
+
 cd Famil*; 
 pdflatex report.tex ; 
 pdflatex report.tex
@@ -60,3 +62,5 @@ options:
   --export-data EXPORT_DATA
                         Export data. Usage: file.ged, .json, .vcf, .sql, or
                         'basepath' for CSVs
+
+```
