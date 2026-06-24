@@ -1,13 +1,32 @@
+```
 IMPORTANT:
     Most of this script is generated using Google Gemini
+    Keep in mind: Gemini is AI and can make mistakes. 
 
 From The Devil's Dictionary (1881-1906) [devil]:
 
   GENEALOGY, n.  An account of one's descent from an ancestor who did
   not particularly care to trace his own.
 
+Features:
+    
+    * sqlite3 / sqlcipher ( with encryption ) backend
+    * wx gui / cli modes
+    * Family network graph using networkx ( with optional member list )
+    * Report generation in html / pdf ( latex ) 
+    *     - with hyperlinked contents and full index
+    *     - support confidential_fields exclusion
+    * QR coded vcard support in reports
+    * Report generation for entire tree or any branch 
+    * Relationship calculator output image with graph and textual description
+    * Import and Export:
+    *       sql dump
+    *       json
+    *       gedcom
+    *       vCards
+    *       sqlite3 / sqlcipher db
+    * Table editors for people and family
 
-```
 start gui:
 python genealogy.py -e sqlite3 -g -d family_new.db
 
