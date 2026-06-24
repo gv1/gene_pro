@@ -30,17 +30,25 @@
 ![Application Screenshot](screenshot.jpg "Screenshot") 
 
 ## Usage:
-1. Clone the repository
+Clone the repository
 ```
 git clone --depth 1 https://github.com/gv1/gene-pro
-```
-[main.zip](https://github.com/gv1/gene_pro/archive/refs/heads/main.zip)
-2. Install the required dependencies:
 cd gene-pro
+
 ```
-pi install -r requirements.txt
+Or  
+download and unzip [main.zip](https://github.com/gv1/gene_pro/archive/refs/heads/main.zip)   
 ```
-3. To launch the application, run the following command from your terminal:
+unzip gene_pro-main.zip
+cd gene_pro-main
+```
+    
+    
+Install the required dependencies:
+```
+pip install -r requirements.txt
+```
+To launch the application, run the following command from your terminal:
 `python genealogy.py`
 
 ### start gui:
