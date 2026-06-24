@@ -33,8 +33,8 @@
 1. Clone the repository
 ```
 git clone --depth 1 https://github.com/gv1/gene-pro
-[main.zip](https://github.com/gv1/gene_pro/archive/refs/heads/main.zip)
 ```
+[main.zip](https://github.com/gv1/gene_pro/archive/refs/heads/main.zip)
 2. Install the required dependencies:
 cd gene-pro
 ```
