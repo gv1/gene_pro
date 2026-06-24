@@ -1,4 +1,4 @@
-__rcs_id__ = "$Id: genealogy.py,v 1.193 2026/06/23 03:11:55 george Exp george $"
+__rcs_id__ = "$Id: genealogy.py,v 1.216 2026/06/24 12:09:53 george Exp $"
 
 import wx
 import wx.lib.scrolledpanel
@@ -85,6 +85,154 @@ class GenealogyIO:
             writer.writerow(colnames)
             writer.writerows(rows)
 
+    def export_subsegment_data(self, filepath, target_group=None, target_family=None):
+        """Filters database parameters to slice out a specific family segment and all its sub-branches."""
+        import sqlite3 as plain_sqlite
+        import networkx as nx
+        
+        query_conditions = []
+        query_params = []
+        
+        # 1. Gather ALL sub-families tracking down from this branch node
+        target_families_manifest = set()
+        if target_family:
+            target_families_manifest.add(target_family.lower().strip())
+            
+        try:
+            # Build a local NetworkX graph of family structural links to discover sub-branches
+            self.db.cursor.execute("SELECT family_name, ancestral_family_name, family_group FROM families")
+            all_fam_records = self.db.cursor.fetchall()
+            
+            G_fam = nx.DiGraph()
+            for f_name, a_name, f_grp in all_fam_records:
+                fn = str(f_name).strip().lower() if f_name else ""
+                an = str(a_name).strip().lower() if a_name else ""
+                fg = str(f_grp).strip().lower() if f_grp else ""
+                
+                if fn:
+                    G_fam.add_node(fn, group=fg)
+                    # If an ancestral link exists, map the directional tree hierarchy
+                    if an and an != fn:
+                        G_fam.add_edge(an, fn)
+                    elif fg and fg != fn:
+                        G_fam.add_edge(fg, fn)
+
+            # If tracking a specific family node, collect all its downstream tree descendants
+            if target_family and target_family.lower().strip() in G_fam:
+                root_node = target_family.lower().strip()
+                descendants = nx.descendants(G_fam, root_node)
+                for d in descendants:
+                    target_families_manifest.add(d)
+            
+            # If tracking a broad group, collect everything inside that ecosystem cluster
+            if target_group and not target_family:
+                tg_lower = target_group.lower().strip()
+                for node, data in G_fam.nodes(data=True):
+                    if data.get('group') == tg_lower or node == tg_lower:
+                        target_families_manifest.add(node)
+                        descendants = nx.descendants(G_fam, node)
+                        target_families_manifest.update(descendants)
+                        
+        except Exception as e:
+            return False, f"Family graph tracking pass failed: {str(e)}"
+
+        # 2. Extract matching records from the FAMILIES table using our manifest
+        try:
+            if target_family and not target_group:
+                # Slicing a strict specific sub-branch path
+                placeholders = ", ".join(["?"] * len(target_families_manifest))
+                self.db.cursor.execute(f"SELECT * FROM families WHERE LOWER(TRIM(family_name)) IN ({placeholders})", list(target_families_manifest))
+            else:
+                # Broad group capture filtering
+                self.db.cursor.execute("SELECT * FROM families WHERE LOWER(TRIM(family_group)) = LOWER(TRIM(?))", (target_group,))
+                
+            family_rows = self.db.cursor.fetchall()
+            self.db.cursor.execute("PRAGMA table_info(families)")
+            family_cols = [c[1] for c in self.db.cursor.fetchall()]
+        except Exception as e:
+            return False, f"Families data harvesting failed: {str(e)}"
+
+        # 3. Extract PEOPLE matching any criteria (Active family, Ancestral link, or Group root)
+        try:
+            p_rows_map = {}
+            self.db.cursor.execute("SELECT * FROM people")
+            all_people = self.db.fetchall() if hasattr(self.db, 'fetchall') else self.db.cursor.fetchall()
+            self.db.cursor.execute("PRAGMA table_info(people)")
+            people_cols = [c[1] for c in self.db.cursor.fetchall()]
+            
+            # Map column indices to look up names accurately
+            col_map = {col: idx for idx, col in enumerate(people_cols)}
+            
+            for p_row in all_people:
+                p_fam = str(p_row[col_map['family_name']]).strip().lower() if p_row[col_map['family_name']] else ""
+                p_anc = str(p_row[col_map['ancestral_family_name']]).strip().lower() if 'ancestral_family_name' in col_map and p_row[col_map['ancestral_family_name']] else ""
+                p_grp = str(p_row[col_map['family_group']]).strip().lower() if 'family_group' in col_map and p_row[col_map['family_group']] else ""
+                
+                match = False
+                # Scenario A: Target parameters watch an explicit family subset chain
+                if target_families_manifest:
+                    if p_fam in target_families_manifest or p_anc in target_families_manifest:
+                        match = True
+                # Scenario B: Target watches a broad parental group bucket
+                elif target_group:
+                    if p_grp == target_group.lower().strip() or p_fam == target_group.lower().strip():
+                        match = True
+                        
+                if match:
+                    p_rows_map[p_row[0]] = p_row # Keyed by unique item ID row index
+            
+            people_rows = list(p_rows_map.values())
+        except Exception as e:
+            return False, f"People lineage collection failed: {str(e)}"
+
+        # --- FIX: Define low_path right here before branching into outputs ---
+        low_path = filepath.lower()
+
+        # 4. Handle Alternate File Format Interceptions (Strictly Isolated Return)
+        if low_path.endswith('.json'):
+            try:
+                export_payload = {
+                    "metadata": {
+                        "scope": target_family or target_group, 
+                        "generated_ist": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
+                    },
+                    "families": [dict(zip(family_cols, r)) for r in family_rows],
+                    "people": [dict(zip(people_cols, r)) for r in people_rows]
+                }
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    json.dump(export_payload, f, indent=4)
+                return True, f"Successfully extracted {len(people_rows)} individuals to JSON file."
+            except Exception as e:
+                return False, f"JSON generation failed: {str(e)}"
+
+        # 5. Route default output down to unencrypted clean SQLite3 Database Structure
+        try:
+            final_path = filepath if low_path.endswith('.db') else f"{filepath}.db"
+            
+            if os.path.exists(final_path):
+                os.remove(final_path)
+                
+            out_conn = plain_sqlite.connect(final_path)
+            out_cur = out_conn.cursor()
+            
+            # Generate target tables matching working structures
+            out_cur.execute("CREATE TABLE families (" + ", ".join([f"{c} TEXT" if c != 'family_id' else "family_id INTEGER PRIMARY KEY" for c in family_cols]) + ")")
+            out_cur.execute("CREATE TABLE people (" + ", ".join([f"{c} TEXT" if c != 'id' else "id INTEGER PRIMARY KEY" for c in people_cols]) + ")")
+            
+            # Inject records
+            if family_rows:
+                f_slots = ", ".join(["?"] * len(family_cols))
+                out_cur.executemany(f"INSERT INTO families ({', '.join(family_cols)}) VALUES ({f_slots})", family_rows)
+            if people_rows:
+                p_slots = ", ".join(["?"] * len(people_cols))
+                out_cur.executemany(f"INSERT INTO people ({', '.join(people_cols)}) VALUES ({p_slots})", people_rows)
+                
+            out_conn.commit()
+            out_conn.close()
+            return True, f"Isolated database initialized containing {len(people_rows)} matching records."
+        except Exception as e:
+            return False, f"SQLite3 output generation failed: {str(e)}"        
+            
     def export_to_sql(self, filepath):
         """Exports the entire database as raw SQL commands using iterdump."""
         try:
@@ -315,28 +463,44 @@ class GenealogyIO:
         except Exception as e:
             return False, str(e)
                 
-    def import_from_json(self, filename="genealogy_data.json"):
-        if self.db.read_only:
-            return
-        with open(filename, 'r') as f:
-            data = json.load(f)
-
-        if "metadata" in data:
-            for key, value in data["metadata"].items():
-                val_to_store = json.dumps(value) if isinstance(value, dict) else str(value)
-                self.db.cursor.execute("REPLACE INTO system_metadata (key, value) VALUES (?, ?)", (key, val_to_store))
+    def import_from_json(self, filepath):
+        """Imports family and people data from a standard JSON dictionary dump."""
+        try:
+            import json
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            people_count = 0
+            family_count = 0
             
-        for table, records in data.items():
-            if table == "metadata": 
-                continue
-            self.db.cursor.execute(f"DELETE FROM {table}")
-            for record in records:
-                keys = ', '.join(record.keys())
-                placeholders = ', '.join(['?'] * len(record))
-                sql = f"INSERT INTO {table} ({keys}) VALUES ({placeholders})"
-                self.db.cursor.execute(sql, list(record.values()))
-    
-        self.db.conn.commit()
+            # 1. Import Families
+            if 'families' in data:
+                for fam in data['families']:
+                    # Use your existing database insertion mechanisms
+                    self.db.cursor.execute(
+                        "INSERT INTO families (family_id, family_group, family_name) VALUES (?, ?, ?)",
+                        (fam.get('family_id'), fam.get('family_group'), fam.get('family_name'))
+                    )
+                    family_count += 1
+                    
+            # 2. Import People
+            if 'people' in data:
+                for person in data['people']:
+                    self.db.cursor.execute(
+                        "INSERT INTO people (id, name, family_group, family_name, family_id) VALUES (?, ?, ?, ?, ?)",
+                        (person.get('id'), person.get('name'), person.get('family_group'), person.get('family_name'), person.get('family_id'))
+                    )
+                    people_count += 1
+                    
+            self.db.conn.commit()
+            
+            # === FIXED FOR v20.01: Explicitly return the success tuple ===
+            return True, f"Successfully imported {people_count} people and {family_count} families."
+            
+        except Exception as e:
+            self.db.conn.rollback() # Safely undo partial imports if it crashes
+            # === FIXED FOR v20.01: Explicitly return the failure tuple ===
+            return False, f"JSON Import Error: {str(e)}"
 
     def import_from_gedcom(self, file_path):
         """Robust GEDCOM parser handling UTF-16 and UTF-8 encodings."""
@@ -616,6 +780,88 @@ class GenealogyIO:
         path_names = [name_map[n] for n in path]
             
         return True, report_kinship, report_standard, path_names, edge_list
+
+    def find_related_people(self, base_id, relation_key):
+        """Returns a list of person rows matching a relation key for a specific base ID."""
+        relation_key = relation_key.strip().lower()
+        
+        # 1. Fetch Children (Leveraging your existing get_children query logic)
+        if relation_key in ['children', 'child', 'son', 'daughter']:
+            self.db.cursor.execute(
+                "SELECT id, name, family_name FROM people WHERE father_id = ? OR mother_id = ?", 
+                (base_id, base_id)
+            )
+            return self.db.cursor.fetchall()
+            
+        # 2. Fetch Parents
+        elif relation_key in ['parents', 'parent', 'father', 'mother']:
+            self.db.cursor.execute("SELECT father_id, mother_id FROM people WHERE id = ?", (base_id,))
+            res = self.db.cursor.fetchone()
+            if not res: 
+                return []
+                
+            parent_ids = [pid for pid in res if pid is not None]
+            if not parent_ids: 
+                return []
+                
+            placeholders = ", ".join(["?"] * len(parent_ids))
+            self.db.cursor.execute(f"SELECT id, name, family_name FROM people WHERE id IN ({placeholders})", parent_ids)
+            return self.db.cursor.fetchall()
+            
+        # 3. Fetch Spouses (Parsing the comma-separated husband/wife string fields)
+        elif relation_key in ['spouses', 'spouse', 'husband', 'wife']:
+            self.db.cursor.execute("SELECT husband_ids, wife_ids FROM people WHERE id = ?", (base_id,))
+            res = self.db.cursor.fetchone()
+            if not res: 
+                return []
+                
+            # Collect and merge IDs from both spouse tracking strings
+            raw_ids = []
+            for id_string in res:
+                if id_string:
+                    raw_ids.extend([s.strip() for s in str(id_string).split(',') if s.strip().isdigit()])
+            
+            if not raw_ids: 
+                return []
+                
+            placeholders = ", ".join(["?"] * len(raw_ids))
+            self.db.cursor.execute(f"SELECT id, name, family_name FROM people WHERE id IN ({placeholders})", [int(x) for x in raw_ids])
+            return self.db.cursor.fetchall()
+            
+        else:
+            print(f"[-] Unknown relationship key: '{relation_key}'")
+            return []
+
+    def find_extended_relatives(self, base_id, target_relationship_label):
+        """Scans the entire NetworkX family graph to find everyone who matches 
+
+        an exact relationship type string (e.g., '1st Cousin', 'Uncle', 'Nephew').
+        """
+        target_label = target_relationship_label.strip().lower()
+        matched_relatives = []
+        
+        # Pull all active records to check valid IDs
+        self.db.cursor.execute("SELECT id, name FROM people")
+        all_people = self.db.cursor.fetchall()
+        
+        print(f"[*] Analyzing family network paths relative to ID {base_id}...")
+        
+        for candidate_id, candidate_name in all_people:
+            if candidate_id == base_id:
+                continue
+                
+            # Utilize your internal path calculation engine pass
+            success, kinship_rep, _, _, _ = self.find_relationship(base_id, candidate_id)
+            
+            if success and kinship_rep:
+                # Extracts the raw kinship term from "Calculated Relationship: X"
+                current_term = kinship_rep.replace("Calculated Relationship:", "").strip().lower()
+                
+                # Check if the generated kinship string matches your lookup token
+                if target_label in current_term:
+                    matched_relatives.append((candidate_id, candidate_name, current_term))
+                    
+        return matched_relatives
 
 
 class GenealogyData:
@@ -1349,7 +1595,7 @@ class EditFamiliesDialog(wx.Dialog):
 
 
 class GenealogyFrame(wx.Frame):
-    def __init__(self, engine_type, db_password, db="family.db", read_only=False):
+    def __init__(self, engine_type, db_password, db="family.db", read_only=False, show_debug_panel=True):
         title_suffix = " [READ-ONLY MODE]" if read_only else ""
         super().__init__(None, title=f"Genealogy Pro{title_suffix}", size=(1150, 800))
         
@@ -1362,23 +1608,36 @@ class GenealogyFrame(wx.Frame):
         self.current_selected_family_id = None 
         self.io_helper = GenealogyIO(self.db)
 
-        self.splitter = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE | wx.SP_3D)
-        self.right_splitter = wx.SplitterWindow(self.splitter, style=wx.SP_3D)        
+        self.default_bmp = self.get_default_avatar()
+        # Create a master vertical layout splitter to dock the console panel at the bottom base
+        self.main_vertical_dock = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE | wx.SP_3D)
+        
+        # for side-by-side layout trees and profiles
+        self.splitter = wx.SplitterWindow(self.main_vertical_dock, style=wx.SP_LIVE_UPDATE | wx.SP_3D)
+        self.right_splitter = wx.SplitterWindow(self.splitter, style=wx.SP_3D)
+
+        self.people_panel = wx.Panel(self.right_splitter) #
+        self.people_sizer = wx.BoxSizer(wx.VERTICAL) #
 
         self.left_panel = wx.Panel(self.splitter)
         tree_sizer = wx.BoxSizer(wx.VERTICAL)
         self.left_sizer = tree_sizer
-
-        self.people_panel = wx.Panel(self.right_splitter)
-        self.people_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.people_label = wx.StaticText(self.people_panel, label="People")
-        self.people_sizer.Add(self.people_label, 0, wx.ALL, 10)
-        self.people_panel.SetSizer(self.people_sizer)
         
-        self.fm_list_view = wx.ListCtrl(self.people_panel, style=wx.LC_REPORT | wx.BORDER_SUNKEN)
-        self.fm_list_view.InsertColumn(0, "Name", width=150)
-        self.fm_list_view.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_fm_list_selection)
-        self.fm_list_view.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self.on_fm_list_right_click)
+        self.people_label = wx.StaticText(self.people_panel, label="Member list") #
+        self.people_sizer.Add(self.people_label, 0, wx.ALL, 10) #
+        
+        self.fm_list_view = wx.ListCtrl(self.people_panel, style=wx.LC_REPORT | wx.BORDER_SUNKEN) #
+        self.fm_list_view.InsertColumn(0, "Name", width=250)  # Bumped column width slightly for names
+        self.fm_list_view.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_fm_list_selection) #
+        self.fm_list_view.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self.on_fm_list_right_click) #
+        
+        # FIX: Explicitly pack the list control into the sizer with expanding stretch capabilities
+        # proportion=1 means take up all remaining available vertical footprint space
+        # flag=wx.EXPAND means stretch out horizontally to fit margins edge-to-edge
+        self.people_sizer.Add(self.fm_list_view, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        
+        # Commit the fully loaded vertical box sizer down onto the structural control panel
+        self.people_panel.SetSizer(self.people_sizer)
 
         self.view_mode = wx.RadioBox(
             self.left_panel, label="View Mode", 
@@ -1425,32 +1684,10 @@ class GenealogyFrame(wx.Frame):
         self.list_sort_desc = False
         self.current_list_data = []
        
-        self.btn_add = wx.Button(self.left_panel, label="Add Person")
-        self.btn_add.Bind(wx.EVT_BUTTON, self.on_add_person_action)
-        self.btn_people = wx.Button(self.left_panel, label="Ed People")
-        self.btn_people.Bind(wx.EVT_BUTTON, self.on_edit_people_action)
-        self.btn_families = wx.Button(self.left_panel, label="Ed Families")
-        self.btn_families.Bind(wx.EVT_BUTTON, self.on_edit_families_action)       
-        self.btn_clean = wx.Button(self.left_panel, label="Remove Duplicates")
-        self.btn_clean.Bind(wx.EVT_BUTTON, self.on_remove_duplicates)
-        self.btn_delete = wx.Button(self.left_panel, label="Delete Selected")
-        self.btn_delete.SetForegroundColour(wx.Colour(180, 0, 0))  
-        self.btn_delete.Bind(wx.EVT_BUTTON, self.on_delete_action)
-
-        if self.db.read_only:
-            self.btn_add.Disable()
-            self.btn_clean.Disable()
-            self.btn_delete.Disable()
-
         self.left_sizer.Add(self.tree, 1, wx.EXPAND | wx.ALL, 5)
         self.left_sizer.Add(self.main_search, 0, wx.EXPAND | wx.ALL, 5)
         self.left_sizer.Add(self.list_view, 1, wx.EXPAND | wx.ALL, 5)
         self.left_sizer.Add(self.view_mode, 0, wx.ALL, 5)
-        self.left_sizer.Add(self.btn_families, 0, wx.EXPAND | wx.ALL, 5)
-        self.left_sizer.Add(self.btn_people, 0, wx.EXPAND | wx.ALL, 5)
-        self.left_sizer.Add(self.btn_add, 0, wx.EXPAND | wx.ALL, 5)
-        self.left_sizer.Add(self.btn_clean, 0, wx.EXPAND | wx.ALL, 5)
-        self.left_sizer.Add(self.btn_delete, 0, wx.EXPAND | wx.ALL, 5) 
         self.left_panel.SetSizer(self.left_sizer)
 
         
@@ -1473,26 +1710,47 @@ class GenealogyFrame(wx.Frame):
 
         self.person_sizer = wx.BoxSizer(wx.VERTICAL)
         header_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.name_display = wx.StaticText(self.tab_person, label="Select a Person")
-        font = self.name_display.GetFont()
-        font.SetPointSize(16); font.SetWeight(wx.FONTWEIGHT_BOLD)
-        self.name_display.SetFont(font)
+        # self.name_display = wx.StaticText(self.tab_person, label="Select a Person")
+        # font = self.name_display.GetFont()
+        # font.SetPointSize(16); font.SetWeight(wx.FONTWEIGHT_BOLD)
+        # self.name_display.SetFont(font)
+
+        profile_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        left_column = wx.BoxSizer(wx.VERTICAL)
+        self.photo_ctrl = wx.StaticBitmap(self.tab_person, bitmap=self.get_default_avatar())
+        self.photo_ctrl.SetCursor(wx.Cursor(wx.CURSOR_HAND)) # Shows the pointing finger on hover
+        self.photo_ctrl.SetToolTip("Click to update photo")
+        self.photo_ctrl.Bind(wx.EVT_LEFT_DOWN, self.on_change_photo)
         
-        self.photo_box_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.photo_ctrl = wx.StaticBitmap(self.tab_person, size=(120, 150), style=wx.BORDER_SIMPLE)
-        self.default_bmp = wx.Bitmap(120, 150)
-        self.photo_ctrl.SetBitmap(self.default_bmp)
+        self.name_label = wx.StaticText(self.tab_person, label="Name")
+        name_font = self.name_label.GetFont()
+        name_font.MakeBold()
+        name_font.SetPointSize(12)
+        self.name_label.SetFont(name_font)
         
-        self.btn_photo = wx.Button(self.tab_person, label="Change Photo")
-        self.btn_photo.Bind(wx.EVT_BUTTON, self.on_change_photo)
-        self.photo_box_sizer.Add(self.photo_ctrl, 0, wx.ALIGN_CENTER)
-        self.photo_box_sizer.Add(self.btn_photo, 0, wx.EXPAND | wx.TOP, 5)
+        # Stack photo and name vertically, centered
+        left_column.Add(self.photo_ctrl, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.ALL, 5)
+        left_column.Add(self.name_label, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 5)
         
+        
+        # --- RIGHT COLUMN: vCard QR Code ---
+        right_column = wx.BoxSizer(wx.VERTICAL)
+        
+        self.qr_ctrl = wx.StaticBitmap(self.tab_person, bitmap=self.generate_vcard_qr("name"))
+        
+        right_column.Add(self.qr_ctrl, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.ALL, 5)
+        
+        
+        # --- ASSEMBLE ---
+        # Add left column, push right column to the far edge using AddStretchSpacer
+        profile_sizer.Add(left_column, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 10)
+        profile_sizer.AddStretchSpacer(1) 
+        profile_sizer.Add(right_column, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 10)        
         if self.db.read_only:
             self.btn_photo.Disable()
         
-        header_sizer.Add(self.name_display, 1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 15)
-        header_sizer.Add(self.photo_box_sizer, 0, wx.ALL, 15)
+        # header_sizer.Add(self.name_display, 1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 15)
+        header_sizer.Add(profile_sizer, 0, wx.ALL, 15)
         self.person_sizer.Add(header_sizer, 0, wx.EXPAND)
 
         self.info_sizer = wx.StaticBoxSizer(wx.VERTICAL, self.tab_person, "Personal Details")
@@ -1586,79 +1844,132 @@ class GenealogyFrame(wx.Frame):
         self.tab_person.SetSizer(self.person_sizer)
         self.tab_person.SetupScrolling(scroll_x=False, scroll_y=True, rate_y=15)
 
+        # Define New Unique Navigation Reference IDs
+        self.ID_NEW_DB = wx.NewIdRef()
+        self.ID_OPEN_DB = wx.NewIdRef()
+        self.ID_REFRESH = wx.NewIdRef()
+        self.ID_ED_PEOPLE = wx.NewIdRef()
+        self.ID_ED_FAMILIES = wx.NewIdRef()
+        self.ID_REMOVE_DUPLICATES = wx.NewIdRef()
+        self.ID_REPORT = wx.NewIdRef() 
+        self.ID_FIND_RELATIONSHIP = wx.NewIdRef()
+        self.ID_FIND_RELATIVES = wx.NewIdRef()
+        self.ID_TOGGLE_DEBUG_PANEL = wx.NewIdRef() #
+        
         menubar = wx.MenuBar()
         file_menu = wx.Menu()
         
+        # Core File Actions
+        new_db_item = file_menu.Append(wx.ID_NEW, "&New Database...\tCtrl+N", "Create a brand new genealogy database")        
         open_db_item = file_menu.Append(wx.ID_OPEN, "Open Database...", "Open a different genealogy database")
         file_menu.AppendSeparator()
         
-        import_sql_item = file_menu.Append(wx.ID_ANY, "Import SQL Dump...")
-        self.Bind(wx.EVT_MENU, self.on_import_sql, import_sql_item)
-        export_sql_item = file_menu.Append(wx.ID_ANY, "Export SQL Dump...")
-        self.Bind(wx.EVT_MENU, self.on_export_sql, export_sql_item)
-        file_menu.AppendSeparator()
+        # Submenu: File -> Import
+        import_submenu = wx.Menu()
+        import_sql_item = import_submenu.Append(wx.ID_ANY, "SQL Dump...")
+        import_csv_item = import_submenu.Append(wx.ID_ANY, "CSV...")
+        import_json_item = import_submenu.Append(wx.ID_ANY, "JSON...")
+        import_gedcom_item = import_submenu.Append(wx.ID_ANY, "GEDCOM...")
+        import_vcard_item = import_submenu.Append(wx.ID_ANY, "vCard...")
+        file_menu.AppendSubMenu(import_submenu, "Import")
         
-        import_csv_item = file_menu.Append(wx.ID_ANY, "Import CSV...")
-        self.Bind(wx.EVT_MENU, self.on_import_csv, import_csv_item)
-        export_csv_item = file_menu.Append(wx.ID_ANY, "Export CSV...")
-        self.Bind(wx.EVT_MENU, self.on_export_csv, export_csv_item)
-        file_menu.AppendSeparator()
-        
-        import_json_item = file_menu.Append(wx.ID_ANY, "Import JSON...")
-        self.Bind(wx.EVT_MENU, self.on_import_json, import_json_item)
-        export_json_item = file_menu.Append(wx.ID_ANY, "Export JSON...")
-        self.Bind(wx.EVT_MENU, self.on_export_json, export_json_item)
-        
-        file_menu.AppendSeparator()       
-        import_gedcom_item = file_menu.Append(wx.ID_ANY, "Import GEDCOM...")
-        self.Bind(wx.EVT_MENU, self.on_import_gedcom, import_gedcom_item)
-        export_gedcom_item = file_menu.Append(wx.ID_ANY, "Export GEDCOM...")
-        self.Bind(wx.EVT_MENU, self.on_export_gedcom, export_gedcom_item)
-        
-        file_menu.AppendSeparator()
-        import_vcard_item = file_menu.Append(wx.ID_ANY, "Import vCard...")
-        self.Bind(wx.EVT_MENU, self.on_import_vcard_ui, import_vcard_item)
-        export_vcard_item = file_menu.Append(wx.ID_ANY, "Export vCard...")
-        self.Bind(wx.EVT_MENU, self.on_export_vcard_ui, export_vcard_item)
-
-        file_menu.AppendSeparator()
-        menu_generate_report = file_menu.Append(wx.ID_ANY, "Export Full Family Report\tCtrl+E", "Generate an HTML and LaTeX report of the entire database")
-        self.Bind(wx.EVT_MENU, lambda e: self.ctx_generate_full_report(), menu_generate_report)
-
-        menu_find_rel = file_menu.Append(wx.ID_ANY, "Find Relationship Between Two People...\tCtrl+R")
-        self.Bind(wx.EVT_MENU, self.on_find_relationship_ui, menu_find_rel)
-        
-        
-        file_menu.AppendSeparator()
-        edit_people_item = file_menu.Append(wx.ID_ANY, "Edit People Table...")
-        self.Bind(wx.EVT_MENU, self.on_edit_people, edit_people_item)       
-        edit_families_item = file_menu.Append(wx.ID_ANY, "Edit Families Table..")
-        self.Bind(wx.EVT_MENU, self.on_edit_families, edit_families_item)
-      
-        file_menu.AppendSeparator()
-        refresh_tree_item = file_menu.Append(wx.ID_ANY, "Refresh Tree")
-        self.Bind(wx.EVT_MENU, self.on_refresh_tree, refresh_tree_item)
-
-        file_menu.AppendSeparator()
-        export_db_item = file_menu.Append(wx.ID_ANY, "Export Database File...")
-        self.Bind(wx.EVT_MENU, self.on_export_db, export_db_item)        
-        import_db_item = file_menu.Append(wx.ID_ANY, "Import Unencrypted Database...")
-        self.Bind(wx.EVT_MENU, self.on_import_db, import_db_item)       
+        # Submenu: File -> Export
+        export_submenu = wx.Menu()
+        export_sql_item = export_submenu.Append(wx.ID_ANY, "SQL Dump...")
+        export_csv_item = export_submenu.Append(wx.ID_ANY, "CSV...")
+        export_json_item = export_submenu.Append(wx.ID_ANY, "JSON...")
+        export_gedcom_item = export_submenu.Append(wx.ID_ANY, "GEDCOM...")
+        export_vcard_item = export_submenu.Append(wx.ID_ANY, "vCard...")
+        export_report_item = export_submenu.Append(wx.ID_ANY, "HTML/TeX Report\tCtrl+E")
+        file_menu.AppendSubMenu(export_submenu, "Export")
         
         file_menu.AppendSeparator()
         exit_item = file_menu.Append(wx.ID_EXIT, "E&xit\tAlt+X")
-        
-        if self.db.read_only:
-            import_csv_item.Enable(False)
-            import_json_item.Enable(False)
-            import_gedcom_item.Enable(False)
-            import_vcard_item.Enable(False)
-            import_db_item.Enable(False)
+
+        tools_menu = wx.Menu()
+        tools_menu.Append(self.ID_NEW_DB, "New Database...\tCtrl+N", "Create a completely fresh database file")
+        tools_menu.Append(self.ID_OPEN_DB, "Open Database...\tCtrl+O", "Open database file")
+        tools_menu.AppendSeparator()
+        tools_menu.Append(self.ID_REFRESH, "Refresh\tF5", "Refresh tracking loops")
+        tools_menu.AppendSeparator()
+        tools_menu.Append(self.ID_ED_PEOPLE, "Edit People...", "Edit individual profile fields directly")
+        tools_menu.Append(self.ID_ED_FAMILIES, "Edit Families...", "Edit macro lineage structures")
+        tools_menu.Append(self.ID_REMOVE_DUPLICATES, "Remove Duplicates...", "Scan records and merge identical individual names")
+        tools_menu.AppendSeparator()
+        tools_menu.Append(self.ID_REPORT, "Generate Report", "Generate HTML/TeX report for the active selection or entire database")
+        tools_menu.AppendSeparator()
+        tools_menu.Append(self.ID_FIND_RELATIONSHIP, "Find Relationship...", "Trace separation degrees between two targets")
+        tools_menu.Append(self.ID_FIND_RELATIVES, "Find Relatives...", "Filter specific kin categories by keyword rules")
+        tools_menu.AppendSeparator()
+
+        debug_menu_item = tools_menu.AppendCheckItem(self.ID_TOGGLE_DEBUG_PANEL, "Toggle Debug Shell", "Toggle bottom workspace terminal box")
+        debug_menu_item.Check(show_debug_panel)       
         
         menubar.Append(file_menu, "&File")
+        menubar.Append(tools_menu, "&Tools")        
         self.SetMenuBar(menubar)
-
+        
+        # Bind Menu Commands
         self.Bind(wx.EVT_MENU, self.on_open_db, open_db_item)
+        self.Bind(wx.EVT_MENU, self.on_import_sql, import_sql_item)
+        self.Bind(wx.EVT_MENU, self.on_import_csv, import_csv_item)
+        self.Bind(wx.EVT_MENU, self.on_import_json, import_json_item)
+        self.Bind(wx.EVT_MENU, self.on_import_gedcom, import_gedcom_item)
+        self.Bind(wx.EVT_MENU, self.on_import_vcard_ui, import_vcard_item)
+        
+        self.Bind(wx.EVT_MENU, self.on_export_sql, export_sql_item)
+        self.Bind(wx.EVT_MENU, self.on_export_csv, export_csv_item)
+        self.Bind(wx.EVT_MENU, self.on_export_json, export_json_item)
+        self.Bind(wx.EVT_MENU, self.on_export_gedcom, export_gedcom_item)
+        self.Bind(wx.EVT_MENU, self.on_export_vcard_ui, export_vcard_item)
+        self.Bind(wx.EVT_MENU, lambda e: self.ctx_generate_full_report(), export_report_item)
+        self.Bind(wx.EVT_MENU, self.on_exit_app, exit_item)
+        
+        # Handle Read-Only constraints dynamically
+        if self.db.read_only:
+            for item in [import_csv_item, import_json_item, import_gedcom_item, import_vcard_item, import_sql_item]:
+                item.Enable(False)    
+        
+
+        self.toolbar = self.CreateToolBar(wx.TB_HORIZONTAL | wx.TB_TEXT)
+        
+
+        
+        # Populate Tools using standard system art layouts
+        self.toolbar.AddTool(self.ID_NEW_DB, "New DB", wx.ArtProvider.GetBitmap(wx.ART_NEW, wx.ART_TOOLBAR, (16,16)), "Create a completely fresh database file")
+        self.toolbar.AddTool(self.ID_OPEN_DB, "Open DB", wx.ArtProvider.GetBitmap(wx.ART_FILE_OPEN, wx.ART_TOOLBAR, (16,16)), "Open database file")        
+        self.toolbar.AddTool(self.ID_REFRESH, "Refresh", wx.ArtProvider.GetBitmap(wx.ART_REDO, wx.ART_TOOLBAR, (16,16)), "Refresh tracking loops")
+        self.toolbar.AddSeparator()
+        self.toolbar.AddTool(self.ID_ED_PEOPLE, "Ed People", wx.ArtProvider.GetBitmap(wx.ART_LIST_VIEW, wx.ART_TOOLBAR, (16,16)), "Edit individual profile fields directly")
+        self.toolbar.AddTool(self.ID_ED_FAMILIES, "Ed Families", wx.ArtProvider.GetBitmap(wx.ART_FOLDER, wx.ART_TOOLBAR, (16,16)), "Edit macro lineage structures")
+        self.toolbar.AddTool(self.ID_REMOVE_DUPLICATES, "Remove Duplicates", wx.ArtProvider.GetBitmap(wx.ART_DELETE, wx.ART_TOOLBAR, (16,16)), "Scan records and merge identical individual names")        
+        self.toolbar.AddSeparator()
+        self.toolbar.AddTool(self.ID_REPORT, "Report", wx.ArtProvider.GetBitmap(wx.ART_PRINT, wx.ART_TOOLBAR, (16,16)), "Generate HTML/TeX report for the active selection or entire database")
+        self.toolbar.AddSeparator() 
+        self.toolbar.AddTool(self.ID_FIND_RELATIONSHIP, "Find Relationship", wx.ArtProvider.GetBitmap(wx.ART_FIND, wx.ART_TOOLBAR, (16,16)), "Trace separation degrees between two targets")
+        self.toolbar.AddTool(self.ID_FIND_RELATIVES, "Find Relatives", wx.ArtProvider.GetBitmap(wx.ART_HELP_SIDE_PANEL, wx.ART_TOOLBAR, (16,16)), "Filter specific kin categories by keyword rules")
+        self.toolbar.AddSeparator()
+        
+        # Keep your checkbox debug controller from v19.86
+        self.toolbar.AddCheckTool(self.ID_TOGGLE_DEBUG_PANEL, "Debug Shell", wx.ArtProvider.GetBitmap(wx.ART_REPORT_VIEW, wx.ART_TOOLBAR, (16,16)), wx.NullBitmap, "Toggle bottom workspace terminal box")
+        self.toolbar.ToggleTool(self.ID_TOGGLE_DEBUG_PANEL, show_debug_panel) #
+        
+        # Bind Actions
+        self.Bind(wx.EVT_TOOL, self.on_refresh_tree, id=self.ID_REFRESH)
+        self.Bind(wx.EVT_TOOL, self.on_edit_people_action, id=self.ID_ED_PEOPLE)
+        self.Bind(wx.EVT_TOOL, self.on_edit_families_action, id=self.ID_ED_FAMILIES)
+        self.Bind(wx.EVT_TOOL, self.on_remove_duplicates, id=self.ID_REMOVE_DUPLICATES)
+        self.Bind(wx.EVT_TOOL, self.on_toolbar_report_action, id=self.ID_REPORT)        
+        self.Bind(wx.EVT_TOOL, self.on_find_relationship_ui, id=self.ID_FIND_RELATIONSHIP)
+        self.Bind(wx.EVT_TOOL, self.on_find_relatives_toolbar_action, id=self.ID_FIND_RELATIVES)
+        self.Bind(wx.EVT_TOOL, self.on_toggle_debug_panel_tool, id=self.ID_TOGGLE_DEBUG_PANEL) #
+        
+        self.toolbar.Realize()
+
+        self.Bind(wx.EVT_MENU, self.on_new_db, new_db_item)
+        self.Bind(wx.EVT_TOOL, self.on_new_db, id=self.ID_NEW_DB)
+        self.Bind(wx.EVT_MENU, self.on_open_db, open_db_item)
+        self.Bind(wx.EVT_TOOL, self.on_open_db, id=self.ID_OPEN_DB)
         self.Bind(wx.EVT_MENU, self.on_exit_app, exit_item)
         
         self.family_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -1715,8 +2026,385 @@ class GenealogyFrame(wx.Frame):
         self.right_splitter.SplitVertically(self.people_panel, self.right_scrolled, 300)
         self.splitter.SplitVertically(self.left_panel, self.right_splitter, 300)
         self.splitter.SetMinimumPaneSize(100)
+
+        # Always build the debugger panel so it remains accessible in the background variable namespace
+        self.build_debugger_console_bar()
+        self.debugger_panel_is_visible = show_debug_panel
+        
+        # CONFIGURATION PASS FOR v19.82: Conditional Layout Docking
+        if show_debug_panel:
+            # Display normally by splitting the vertical view workspace window
+            self.main_vertical_dock.SplitHorizontally(self.splitter, self.debugger_panel, -150)
+        else:
+            # Initialize the interface tree and profile panes across the full screen space, leaving console un-split
+            self.main_vertical_dock.Initialize(self.splitter)
+            self.debugger_panel.Hide()
+            
+        self.main_vertical_dock.SetMinimumPaneSize(50)
+        
         dprint("restore this refresh_tree()")
         self.refresh_tree()
+
+    def get_default_avatar(self):
+        """Generates a default 150x150 placeholder avatar bitmap."""
+        # Create a blank 150x150 image (matches the size of our custom photos)
+        img = wx.Image(150, 150, clear=True)
+        
+        # Fill it with a generic light gray background (RGB: 220, 220, 220)
+        img.SetRGB(wx.Rect(0, 0, 150, 150), 220, 220, 220)
+        
+        # Convert the raw Image data into a UI-ready Bitmap
+        return wx.Bitmap(img)
+        
+    def on_change_photo(self, event):
+        """Triggered when the user clicks directly on the profile picture."""
+        with wx.FileDialog(self, "Select new profile photo", wildcard="Image files (*.jpg;*.png)|*.jpg;*.png", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                new_image_path = dlg.GetPath()
+                
+                # Load and scale the new image
+                img = wx.Image(new_image_path, wx.BITMAP_TYPE_ANY)
+                img = img.Scale(150, 150, wx.IMAGE_QUALITY_HIGH) # Adjust size to fit your UI
+                self.photo_ctrl.SetBitmap(wx.Bitmap(img))
+                self.Layout() # Force UI refresh
+                
+                # TODO: Save the new file path to your database
+                
+        # event.Skip() is critical here so wxPython doesn't freeze the mouse focus
+        event.Skip() 
+
+    def generate_vcard_qr(self, name):
+        """Generates a vCard QR code and returns it directly as a wx.Bitmap."""
+        import qrcode
+        import io
+        
+        # Standard vCard formatting
+        vcard_data = f"BEGIN:VCARD\nVERSION:3.0\nFN:{name}\nEND:VCARD"
+        
+        # Generate the QR Code using PIL
+        qr = qrcode.QRCode(box_size=4, border=2)
+        qr.add_data(vcard_data)
+        qr.make(fit=True)
+        pil_img = qr.make_image(fill_color="black", back_color="white")
+        
+        # Convert the PIL image to a wx.Bitmap in memory without saving to disk
+        with io.BytesIO() as byte_stream:
+            pil_img.save(byte_stream, format="PNG")
+            byte_stream.seek(0)
+            wx_img = wx.Image(byte_stream, wx.BITMAP_TYPE_PNG)
+            
+        return wx.Bitmap(wx_img)
+
+        
+    def on_new_db(self, event):
+        """Creates a completely fresh database file, formats it, and updates application state."""
+        # Use FD_SAVE and FD_OVERWRITE_PROMPT to ensure safe file creation behaviors
+        with wx.FileDialog(self, "Create New Database", wildcard="SQLite DB files (*.db)|*.db", style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                new_db_path = dlg.GetPath()
+                
+                # Auto-append extension if the user forgot to type it
+                if not new_db_path.lower().endswith('.db'):
+                    new_db_path += '.db'
+                    
+                # Close the currently active database connection cleanly
+                try:
+                    self.db.conn.close()
+                except Exception as e:
+                    dprint(f"Warning closing current db: {e}")
+                
+                # Reinitialize connection against the new file path. 
+                # Your engine will automatically build the empty table schemas.
+                # Note: We force read_only=False because you cannot create a new DB in view-only mode!
+                self.db = GenealogyData(db=new_db_path, password=None, read_only=False) 
+                self.io_helper = GenealogyIO(self.db)
+                
+                # Persist the change to configs so the app boots to this file next time
+                engine = getattr(self, 'engine_type', 'sqlite3')
+                update_saved_settings(new_db_path, engine)
+                
+                # Reset UI states
+                self.current_selected_id = None
+                self.current_selected_family_id = None
+                self.refresh_tree()
+                
+                wx.MessageBox(f"Successfully created and mounted new database:\n{new_db_path}", "Database Created", wx.OK | wx.ICON_INFORMATION)
+                wx.LogStatus(f"Active database set to: {new_db_path}")
+        
+    def on_toolbar_report_action(self, event):
+        """Resolves the active UI selection context and dynamically triggers the appropriate report scope."""
+        target_group = None
+        target_family = None
+        
+        mode = self.view_mode.GetSelection()
+
+        # Scenario 1: User is operating inside the Tree View mode
+        if mode == 0:  
+            sel = self.tree.GetSelection()
+            # If a valid specific node is selected (and it is not the global "All Families" root)
+            if sel and sel.IsOk() and sel != self.root_item:
+                node_data = self.tree.GetItemData(sel)
+                if node_data:
+                    # Determine if this node is a sub-branch (family_name) or a top-level folder (family_group)
+                    self.db.cursor.execute("SELECT family_group FROM families WHERE family_name = ?", (node_data,))
+                    res = self.db.cursor.fetchone()
+                    
+                    if res:
+                        # It is a specific sub-branch. Isolate the family and its parent group.
+                        target_group = res[0] if res[0] else node_data
+                        target_family = node_data
+                    else:
+                        # If it is not found as a family_name, it must be a top-level Group bucket.
+                        target_group = node_data
+
+        # Scenario 2: User is operating inside the Family List mode
+        elif mode == 2:  
+            if getattr(self, 'current_selected_family_id', None):
+                self.db.cursor.execute("SELECT family_group, family_name FROM families WHERE family_id = ?", (self.current_selected_family_id,))
+                res = self.db.cursor.fetchone()
+                if res:
+                    target_group = res[0]
+                    target_family = res[1]
+
+        # Scenario 3: If no valid selection was made, or the user clicked the root "All Families" node,
+        # or the user is in "People List" mode (where families aren't explicitly selected), 
+        # both variables safely remain `None`, which triggers a global database report by default.
+        
+        # Hand off the resolved parameters to the report engine
+        self.ctx_generate_full_report(target_group=target_group, target_family=target_family)
+
+
+    def on_toggle_debug_panel_tool(self, event):
+        """Docks or detaches the debugger text engine dynamically from the primary view frame layout."""
+        is_checked = event.IsChecked()
+        
+        if is_checked and not self.debugger_panel_is_visible:
+            # Unhide and dock back down into a split horizonal pane layout orientation
+            self.debugger_panel.Show()
+            self.main_vertical_dock.SplitHorizontally(self.splitter, self.debugger_panel, -150)
+            self.debugger_panel_is_visible = True
+            
+        elif not is_checked and self.debugger_panel_is_visible:
+            # Detach the layout split pane and pull workspace up to full layout display sizes
+            self.main_vertical_dock.Unsplit(self.debugger_panel)
+            self.debugger_panel.Hide()
+            self.debugger_panel_is_visible = False
+            
+        self.main_vertical_dock.Layout()
+
+    def on_find_relatives_toolbar_action(self, event):
+        """Launches a lookup modal to extract every single relative matching 
+
+        a keyword relation type and filters the primary People List display panel.
+        """
+        base_person_lbl = f"ID: {self.current_selected_id}" if self.current_selected_id else ""
+        
+        dlg = wx.Dialog(self, title="Filter Relatives by Keyword", size=(400, 220))
+        vbox = wx.BoxSizer(wx.VERTICAL)
+        
+        # Field 1: Target Selector Identification
+        hbox1 = wx.BoxSizer(wx.HORIZONTAL)
+        lbl1 = wx.StaticText(dlg, label="Base Person (Name or ID):")
+        txt_person = wx.TextCtrl(dlg, value=base_person_lbl)
+        hbox1.Add(lbl1, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        hbox1.Add(txt_person, 1, wx.ALL | wx.EXPAND, 5)
+        
+        # Field 2: Target Relationship Type Keyword
+        hbox2 = wx.BoxSizer(wx.HORIZONTAL)
+        lbl2 = wx.StaticText(dlg, label="Relationship Keyword:\n(e.g. cousin, uncle, sibling)")
+        txt_keyword = wx.TextCtrl(dlg, value="")
+        txt_keyword.SetHint("Type kinship term to extract...")
+        hbox2.Add(lbl2, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        hbox2.Add(txt_keyword, 1, wx.ALL | wx.EXPAND, 5)
+        
+        btn_sizer = dlg.CreateSeparatedButtonSizer(wx.OK | wx.CANCEL)
+        vbox.Add(hbox1, 0, wx.EXPAND | wx.ALL, 10)
+        vbox.Add(hbox2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        vbox.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        
+        dlg.SetSizer(vbox)
+        dlg.Layout()
+        
+        if dlg.ShowModal() == wx.ID_OK:
+            person_query = txt_person.GetValue().strip()
+            keyword_query = txt_keyword.GetValue().strip().lower()
+            
+            if not person_query or not keyword_query:
+                wx.MessageBox("Both lookup parameters are mandatory.", "Filter Canceled", wx.ICON_WARNING)
+                dlg.Destroy()
+                return
+                
+            # Resolve the raw string pointer down to a solid base integer row ID
+            base_resolved_id = None
+            if "(" in person_query and ")" in person_query:
+                try: base_resolved_id = int(person_query.split("(")[-1].replace(")", "").strip())
+                except: pass
+            elif person_query.isdigit():
+                base_resolved_id = int(person_query)
+            else:
+                self.db.cursor.execute("SELECT id FROM people WHERE name = ?", (person_query,))
+                res = self.db.cursor.fetchone()
+                if res: base_resolved_id = res[0]
+                
+            if not base_resolved_id:
+                wx.MessageBox(f"Could not locate a record matching '{person_query}' inside tracking profiles.", "Lookup Error", wx.ICON_ERROR)
+                dlg.Destroy()
+                return
+                
+            # Execute the cross-network graph tracing lookup loop
+            self.execute_relatives_filter_pipeline(base_resolved_id, keyword_query)
+            
+        dlg.Destroy()
+
+    def execute_relatives_filter_pipeline(self, base_id, keyword):
+        """Forces the left notebook panel down to 'People List' view mode, filters rows 
+
+        dynamically via NetworkX kinship generation string maps, and repopulates list_view.
+        """
+        # 1. Flip the View Mode radio box choice tracker to 'People List' (Index position 1)
+        self.view_mode.SetSelection(1)
+        self.on_toggle_view(None) # Force layout panel visibility toggles to engage cleanly
+        
+        # 2. Extract every entry row matching criteria
+        self.db.cursor.execute("SELECT name, family_group, family_name, family_id, id FROM people")
+        all_entries = self.db.cursor.fetchall()
+        
+        filtered_matches = []
+        
+        for name, fg, fn, f_id, p_id in all_entries:
+            if p_id == base_id:
+                continue
+                
+            # Leverage your internal path separation network loop mapping
+            success, kinship_rep, _, _, _ = self.find_relationship(base_id, p_id)
+            
+            if success and kinship_rep:
+                clean_term = kinship_rep.replace("Calculated Relationship:", "").strip().lower()
+                # Check if user keyword matches the calculated kinship term
+                if keyword in clean_term:
+                    filtered_matches.append((name, fg, fn, f_id, p_id))
+                    
+        # 3. Inject the results into the list_view container layout
+        self.list_view.DeleteAllItems() #
+        self.current_list_data = filtered_matches # Override list scope parameter tracking array
+        
+        if not filtered_matches:
+            wx.MessageBox(f"Found 0 family members matching the category filter keyword '{keyword}' relative to this individual.", "Filter Completed")
+            return
+            
+        for idx, row in enumerate(filtered_matches):
+            self.list_view.InsertItem(idx, str(row[0] if row[0] is not None else "")) # Name
+            self.list_view.SetItem(idx, 1, str(row[1] if row[1] is not None else "")) # Family
+            self.list_view.SetItem(idx, 2, str(row[2] if row[2] is not None else "")) # Nickname
+            self.list_view.SetItem(idx, 3, str(row[3] if row[3] is not None else "")) # Family ID
+            self.list_view.SetItem(idx, 4, str(row[4] if row[4] is not None else "")) # ID
+            self.list_view.SetItemData(idx, row[4]) #
+        
+    def build_debugger_console_bar(self):
+        """Constructs a unified, single-pane terminal window mimicking a native interactive Python shell."""
+        import code
+        
+        self.debugger_panel = wx.Panel(self.main_vertical_dock)
+        self.debugger_panel.SetBackgroundColour(wx.Colour(240, 242, 245))
+        
+        panel_vbox = wx.BoxSizer(wx.VERTICAL)
+        
+        console_lbl = wx.StaticText(self.debugger_panel, label="Unified Python Interactive Shell Console")
+        font = console_lbl.GetFont()
+        font.SetWeight(wx.FONTWEIGHT_BOLD)
+        console_lbl.SetFont(font)
+        
+        # Context Environment Definitions mapped directly into interpreter runtime variables
+        self.shell_locals = {
+            'frame': self,
+            'db': self.db,
+            'io': self.io_helper,
+            'wx': wx,
+            'current_id': getattr(self, 'current_selected_id', None)
+        }
+        
+        # Initialize the console engine
+        self.console_shell = code.InteractiveConsole(locals=self.shell_locals)
+        
+        # v19.84 CHANGE: Single, combined Read/Write terminal control block
+        self.terminal = wx.TextCtrl(self.debugger_panel, style=wx.TE_MULTILINE | wx.TE_RICH | wx.TE_PROCESS_ENTER)
+        self.terminal.SetBackgroundColour(wx.Colour(30, 30, 30))
+        self.terminal.SetForegroundColour(wx.Colour(240, 240, 240))
+        self.terminal.SetFont(wx.Font(10, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+        
+        # Write welcome message and seed the initial terminal prompt
+        self.terminal.AppendText("Python Interactive Shell Environment Loaded. Globals: 'frame', 'db', 'io'\n>>> ")
+        
+        # Track the exact character position where the current user-input prompt zone begins
+        self.prompt_start_pos = self.terminal.GetLastPosition()
+        
+        # Bind keystroke actions to control custom cursor evaluations
+        self.terminal.Bind(wx.EVT_KEY_DOWN, self.on_terminal_key_down)
+        
+        panel_vbox.Add(console_lbl, 0, wx.ALL, 5)
+        panel_vbox.Add(self.terminal, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        
+        self.debugger_panel.SetSizer(panel_vbox)
+
+    def on_terminal_key_down(self, event):
+        """Intercepts keyboard inputs to process inline commands at the active terminal prompt."""
+        key_code = event.GetKeyCode()
+        
+        # Process command execution upon encountering a standard Return key
+        if key_code in [wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER]:
+            total_text_length = self.terminal.GetLastPosition()
+            
+            # Isolate only the code string written after the prompt marker
+            command_line = self.terminal.GetRange(self.prompt_start_pos, total_text_length)
+            
+            # Append a newline to visually shift down the display carriage
+            self.terminal.AppendText("\n")
+            
+            # Sync context handles
+            self.shell_locals['current_id'] = self.current_selected_id
+            
+            import sys
+            from io import StringIO
+            
+            # Temporarily trap standard system print outputs
+            old_stdout, old_stderr = sys.stdout, sys.stderr
+            captured_stdout = sys.stdout = StringIO()
+            captured_stderr = sys.stderr = StringIO()
+            
+            # Push the line down to the incremental execution state compiler
+            needs_more_input = self.console_shell.push(command_line)
+            
+            # Restore pipeline environments
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+            
+            # Extract standard execution trace dump writeouts
+            output_logs = captured_stdout.getvalue()
+            error_logs = captured_stderr.getvalue()
+            
+            if output_logs:
+                self.terminal.AppendText(output_logs)
+            if error_logs:
+                self.terminal.AppendText(error_logs)
+                
+            # Determine correct prefix prompt text to inject next
+            prompt_marker = "... " if needs_more_input else ">>> "
+            self.terminal.AppendText(prompt_marker)
+            
+            # Advance the tracking bookmark index pointer up to the fresh baseline edge
+            self.prompt_start_pos = self.terminal.GetLastPosition()
+            self.terminal.ShowPosition(self.prompt_start_pos)
+            
+            # Veto the event so wxTextCtrl doesn't inject a second trailing blank newline line
+            return
+            
+        # Safety constraint: Prevent users from backspacing out the active '>>> ' or '... ' text markers
+        elif key_code == wx.WXK_BACK:
+            current_cursor_pos = self.terminal.GetInsertionPoint()
+            if current_cursor_pos <= self.prompt_start_pos:
+                # Discard keystroke action pass
+                return
+                
+        event.Skip()
 
     def on_edit_people_action(self, event):
         self.on_edit_people(event)
@@ -1835,7 +2523,6 @@ class GenealogyFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda e: self.ctx_generate_full_report(target_group=f_group), item_report_grp)
         self.Bind(wx.EVT_MENU, lambda e: self.ctx_generate_full_report(target_group=f_group, target_family=f_name), item_report_fam)
 
-
         menu.AppendSeparator()
         item_exp_graphml = menu.Append(wx.ID_ANY, "Export in graphml")
         item_exp_gexf = menu.Append(wx.ID_ANY, "Export in gexf")
@@ -1845,6 +2532,9 @@ class GenealogyFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda e: self.ctx_export_family_graph(f_group, 'gexf'), item_exp_gexf)
         self.Bind(wx.EVT_MENU, lambda e: self.ctx_export_family_graph(f_group, 'gml'), item_exp_gml)
         
+        menu.AppendSeparator()
+        item_extract_sub_db = menu.Append(wx.ID_ANY, f"Extract '{f_name}' Segment to Standalone File...")
+        self.Bind(wx.EVT_MENU, lambda e: self.ctx_extract_segment_ui(target_group=f_group, target_family=f_name), item_extract_sub_db)
 
         if not self.db.read_only:
             
@@ -2393,8 +3083,19 @@ class GenealogyFrame(wx.Frame):
         class FamilyTable():
             def __init__(self):
                 self.families = {}
+                # self.groups = []
                 self.orderd = []
+                
             def add_family(self, f):
+                # Added to fix missing nodes.
+                # Check this
+                if f[2] == '':
+                    f_tmp = (f[0],f[1],f[0])
+                    f = f_tmp
+                if f[1] ==f[2] :
+                    f_tmp = (f[0],f[1],f[0])
+                    f = f_tmp
+                # till here    
                 if f[0] not in self.families.keys():
                     self.families[f[0]] = {}
                 self.families[f[0]][f[1]] = list(f)
@@ -2409,39 +3110,57 @@ class GenealogyFrame(wx.Frame):
                         self.orderd.append(fms[fm])
                         d = fms[fm]
                     alld.append(self.orderd)
-                
+            def add_group(self):
+                # if the group is not in the families hash, add it.
+                for grp in self.families.keys():
+                    fms = self.families[grp]
+                    if not any(row[1] == grp for row in fms):
+                        self.families[grp][grp] = (grp,grp,'')                
+            def groups(self):
+                self.groups = {row[0] for row in self.all_families}
         ft = FamilyTable()
         for row in self.all_families:
             ft.add_family(row)
+        # ft.add_group()  # add if group missing.
+            
         ft.order()
         
         import networkx as nx
         
-        for group in ft.families.keys():
+        for group in ft.families.keys():            
             graph_dict = ft.families[group]
+            # graph_dict[group]=[group,group,''] # test
             G = nx.Graph()
-
             for source, values in graph_dict.items():
-                neighbor = values[2]  
-                G.add_edge(source, neighbor)
+                neighbor = values[2]
+                if source is not None and neighbor is not None:
+                    G.add_edge(source, neighbor)
+                elif source is not None:
+                    G.add_node(source)
+                elif neighbor is not None:
+                    G.add_node(neighbor)
 
             from networkx.algorithms import dfs_predecessors
             x = dfs_predecessors(G)
+            # breakpoint()
             
             item_hash = {}
             ans_node = self.add_tree_item(self.root_item, group)            
             item_hash[group] = ans_node
-            ans_node = self.add_tree_item(ans_node, group.lower())            
-            item_hash[group.lower()] = ans_node
+            # ans_node = self.add_tree_item(ans_node, group.lower())            
+            # item_hash[group.lower()] = ans_node
             
             from networkx.algorithms import bfs_tree
             try:
-                x = bfs_tree(G, group.lower())
+                # x = bfs_tree(G, group.lower())
+                # x = bfs_tree(G, group.lower())
+                x = bfs_tree(G, group)
             except Exception as e:
-                print(f"error: {e}")
+                print(f"group error: {e}")
                 continue
                 
             fns_pairs = x.edges()
+            # breakpoint()
             for fns_pair in fns_pairs:
                 fn = fns_pair[0]
                 if not ans_node:
@@ -2460,6 +3179,8 @@ class GenealogyFrame(wx.Frame):
         return
 
     def add_tree_item(self, ans_node, fn):
+        if fn == None or fn == '':
+            return None
         fn_node = self.tree.AppendItem(ans_node, f"{fn} ▾")
         self.tree.SetItemData(fn_node, fn)
         return fn_node
@@ -2492,7 +3213,7 @@ class GenealogyFrame(wx.Frame):
         self.db.cursor.execute("SELECT * FROM families WHERE family_name = ?", (subfam_key,))
         res = self.db.cursor.fetchone()
         if res is None:
-            self.family_title_text.SetLabel(f"Subfamily: {subfam_key}")
+            self.family_title_text.SetLabel(f"Family Group: {subfam_key}")
         else:
             self.family_title_text.SetLabel(f"Family: {subfam_key}")
             
@@ -2627,8 +3348,8 @@ class GenealogyFrame(wx.Frame):
         if row:
             colnames = [d[0] for d in self.db.cursor.description]
             data = dict(zip(colnames, row))
-            self.name_display.SetLabel(data['name'])
-            
+            # self.name_display.SetLabel(data['name'])
+            self.name_label.SetLabel(data['name'])
             for key in self.fields:
                 if key not in ["father_name", "mother_name", "husband_names", "wife_names", "son_names", "daughter_names"]:
                     val = data.get(key, "")
@@ -2642,6 +3363,12 @@ class GenealogyFrame(wx.Frame):
             self._display_multi_relational_field(data, 'daughter_ids', 'daughter_names')
             
             self.load_and_display_photo(data.get('local_photo_path'))
+
+            new_qr_bitmap = self.generate_vcard_qr(data['name'])
+            self.qr_ctrl.SetBitmap(new_qr_bitmap)
+            self.qr_ctrl.Refresh()
+            self.tab_person.Layout() 
+            
 
     def clean_id_list(self, raw_input):
         if not raw_input: return ""
@@ -2970,7 +3697,8 @@ class GenealogyFrame(wx.Frame):
             success, msg = self.db.delete_person(self.current_selected_id)
             if success:
                 self.current_selected_id = None
-                self.name_display.SetLabel("Select a Person")
+                # self.name_display.SetLabel("Select a Person")
+                self.name_label.SetLabel("Select a Person")
                 for key in self.fields: self.fields[key].SetValue("")
                 self.load_and_display_photo(None)
                 mode = self.view_mode.GetSelection()
@@ -2987,7 +3715,8 @@ class GenealogyFrame(wx.Frame):
                 if self.db.delete_branch_recursive(self.current_selected_id):
                     self.db.conn.commit()
                     self.current_selected_id = None
-                    self.name_display.SetLabel("Select a Person")
+                    # self.name_display.SetLabel("Select a Person")
+                    self.name_label.SetLabel("Select a Person")
                     for key in self.fields: self.fields[key].SetValue("")
                     self.load_and_display_photo(None)
                     mode = self.view_mode.GetSelection()
@@ -3060,10 +3789,34 @@ class GenealogyFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda e: self.ctx_export_family_graph(f_group, 'graphml'), item_exp_graphml)
         self.Bind(wx.EVT_MENU, lambda e: self.ctx_export_family_graph(f_group, 'gexf'), item_exp_gexf)
         self.Bind(wx.EVT_MENU, lambda e: self.ctx_export_family_graph(f_group, 'gml'), item_exp_gml)
-                
+
+        menu.AppendSeparator()
+        item_extract_tree_db = menu.Append(wx.ID_ANY, f"Extract '{node_name}' Branch to Standalone File...")
+        self.Bind(wx.EVT_MENU, lambda e: self.ctx_extract_segment_ui(target_group=f_group, target_family=node_name), item_extract_tree_db)
+        
+        
         self.PopupMenu(menu)
         menu.Destroy()
 
+    def ctx_extract_segment_ui(self, target_group=None, target_family=None):
+        """Launches a file selection window offering targeted data slice dumps."""
+        scope_lbl = target_family if target_family else target_group
+        wildcards = "SQLite3 Database (*.db)|*.db|JSON File (*.json)|*.json"
+        
+        default_name = f"Segment_{scope_lbl.replace(' ', '_')}.db"
+        
+        with wx.FileDialog(self, f"Extract {scope_lbl} Scope...", 
+                           defaultFile=default_name,
+                           wildcard=wildcards, 
+                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                path = dlg.GetPath()
+                success, msg = self.io_helper.export_subsegment_data(path, target_group=target_group, target_family=target_family)
+                if success:
+                    wx.MessageBox(msg, "Extraction Successful", wx.OK | wx.ICON_INFORMATION)
+                else:
+                    wx.MessageBox(msg, "Extraction Error", wx.OK | wx.ICON_ERROR)
+        
     def ctx_add_subfamily(self, item):
         if self.db.read_only: return
         parent = self.tree.GetItemParent(item)
@@ -3557,8 +4310,87 @@ def get_db_password():
         return password
     return None
 
+def load_saved_db_name():
+    """Reads the fallback database path from config.json, or checks for a local family.db file."""
+    config_file = "config.json"
+    
+    # Tier 1: Look for an explicit saved path parameter array inside the config file
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                data = json.load(f)
+                saved_path = data.get("last_db_path")
+                if saved_path:
+                    return saved_path
+        except:
+            pass
+            
+    # Tier 2: If config has no valid key, scan the current working path for family.db
+    if os.path.exists("family.db"):
+        return "family.db"
+        
+    # Tier 3: Return None to signal that a brand-new file structure must be initialized
+    return None
 
+def update_saved_db_name(db_path):
+    """Saves or updates the active database tracking reference inside config.json."""
+    config_file = "config.json"
+    data = {}
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                data = json.load(f)
+        except:
+            pass
 
+def load_saved_settings():
+    """Reads the fallback database path and engine preference from config.json,
+
+    or falls back to checking for a local family.db file.
+    """
+    config_file = "config.json"
+    saved_path = None
+    saved_engine = "sqlite3"  # Default fallback engine baseline
+    
+    # Tier 1: Inspect config.json for explicit saved properties
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                data = json.load(f)
+                saved_path = data.get("last_db_path")
+                saved_engine = data.get("last_engine_type", "sqlite3")
+                if saved_path:
+                    return saved_path, saved_engine
+        except:
+            pass
+            
+    # Tier 2: Check if family.db exists locally in the workspace folder
+    if os.path.exists("family.db"):
+        return "family.db", "sqlite3"
+        
+    # Tier 3: Return None for path, defaulting to sqlite3 as the creation engine
+    return None, "sqlite3"
+
+def update_saved_settings(db_path, engine_type):
+    """Saves or updates the active database path and engine type inside config.json."""
+    config_file = "config.json"
+    data = {}
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                data = json.load(f)
+        except:
+            pass
+            
+    data["last_db_path"] = db_path
+    data["last_engine_type"] = engine_type
+    try:
+        with open(config_file, 'w') as f:
+            json.dump(data, f, indent=4)
+    except:
+        pass
+
+        
 class Database:
     def __init__(self, db_path, engine_type='sqlite3', password=None):
         self.db_path = db_path
@@ -3807,12 +4639,15 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Genealogy Data Utility")
     parser.add_argument("-p", "--password", help="Password for SQLCipher database")
     parser.add_argument("-e", "--engine", choices=['sqlite3', 'sqlcipher'], default='sqlite3', help="Engine: sqlite3 (default) or sqlcipher")
-    parser.add_argument("-d", "--db", help="Path to database file", required=True)
+    parser.add_argument("-d", "--db", default=None, help="Path to database file")
+    parser.add_argument("-v", "--verbose", nargs='?', type=int, const=2, default=0, 
+                        help="Enable debug logging (optional level int, defaults to 2 if flag used)")
     parser.add_argument("-i", "--input", help="Input file path (Legacy)")
     parser.add_argument("-o", "--output", help="Output file path (Legacy)")
     parser.add_argument("-f", "--format", choices=['csv', 'gedcom', 'json', 'jpg', 'jpeg', 'png', 'tex'], help="File format for export or graphing")
     parser.add_argument("-r", "--readonly", action='store_true', help="Boot up database structure in safe Read-Only mode")
-
+    parser.add_argument("--debug-panel", action='store_true', help="Boot up with the unified bottom interactive debugger shell active")
+    
     parser.add_argument("--report", action="store_true", help="Generate a family report")
     parser.add_argument("--group", type=str, help="Specify a target Family Group")
     parser.add_argument("--branch", type=str, help="Specify a target Sub-Branch")
@@ -3829,38 +4664,82 @@ def parse_arguments():
     return parser.parse_args()
 
 def main():
-    args = parse_arguments()
+    global debug 
+    args = parse_arguments() #
+
+    debug = args.verbose    
     
-    # --- v19.42 Auto-detect CLI mode ---
-    # If the user requests any automation task, silently force CLI mode
-    is_cli_task = args.cli or args.report or getattr(args, 'export_data', None) or getattr(args, 'import_file', None) or getattr(args, 'export_graph', None)
+    if debug > 0:
+        debug = 2
+        print("[*] Verbose logging enabled (debug level {debug})")   
+    # Auto-detect headless CLI mode
+    is_cli_task = args.cli or args.report or getattr(args, 'export_data', None) or getattr(args, 'import_file', None) or getattr(args, 'export_graph', None) #
     if is_cli_task:
-        args.gui = False
+        args.gui = False #
         
+    # LINEAGE RESOLUTION FOR v19.89
+    target_db_file = args.db
+    
+    # We check if the argument parser flag matches the default state
+    # If the user explicitly typed '-e sqlcipher', we respect it over the config fallback
+    engine_specified = '--engine' in sys.argv or '-e' in sys.argv
+    target_engine = args.engine
+    
+    if not target_db_file:
+        # Load both values from tracking config or local folder scans
+        config_path, config_engine = load_saved_settings()
+        target_db_file = config_path
+        if not engine_specified:
+            target_engine = config_engine
+            
+    if not target_db_file:
+        if not args.gui: #
+            print("[-] Error: Headless operation aborted. No database specified.") #
+            return #
+        else: #
+            target_db_file = "family.db" #
+            target_engine = "sqlite3"  # Explicitly enforce sqlite3 for fresh creations
+            print(f"[*] Initializing brand-new {target_engine} database at: './{target_db_file}'") #
+            
+    # Persist the finalized configuration values back to settings
+    update_saved_settings(target_db_file, target_engine)
+    
     try:
-        db = Database(db_path=args.db, engine_type=args.engine, password=args.password)
+        # Connect using the cleanly resolved database path and engine type definitions
+        db = Database(db_path=target_db_file, engine_type=target_engine, password=args.password)
     except Exception as e:
-        dprint(f"Failed to connect to database: {e}")
-        return
+        dprint(f"Failed to connect to database: {e}") 
+        return 
 
-    if args.gui:
-        app = wx.App()
-        if args.password is None:
+    if args.gui: 
+        app = wx.App() 
+        
+        # === v19.96 FIX: Intelligent Password Prompting ===
+        pwd = args.password
+        
+        # Only summon the UI password dialog if the engine actually requires encryption
+        if target_engine == 'sqlcipher' and pwd is None:
             pwd = get_db_password()
-            if pwd:
-                db_file = args.db
-                if os.path.exists(db_file):
-                    frame = GenealogyFrame(engine_type=args.engine, db=db_file, db_password=pwd, read_only=args.readonly)
-                    pwd = None
-                    frame.Show()
-                    app.MainLoop()
-        else:
-            wx.MessageBox("Password required to access database.", "Access Denied", wx.ICON_ERROR)
-            app.ExitMainLoop()
-    else:
-        run_cli_mode(db, args)
+            if not pwd:
+                # If they cancel the dialog on an encrypted DB, abort the launch safely
+                wx.MessageBox("Password required to access encrypted database.", "Access Denied", wx.ICON_ERROR)
+                app.ExitMainLoop()
+                return
+                
+        # If the engine is sqlite3, pwd safely remains None and bypasses the dialog entirely!
+        frame = GenealogyFrame(
+            engine_type=target_engine,
+            db=target_db_file, 
+            db_password=pwd, 
+            read_only=args.readonly,
+            show_debug_panel=args.debug_panel
+        )
+        frame.Show()
+        app.MainLoop()
+        
+    else: 
+        run_cli_mode(db, args) 
 
-
-
+        
 if __name__ == "__main__":
     main()
